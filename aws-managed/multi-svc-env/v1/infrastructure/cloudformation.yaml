@@ -1,163 +1,217 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: Simple Lambda based HTTP service template
-
+Description: Deploy a service on AWS Fargate, hosted in a public subnet, and accessible via a load balancer.
 Mappings:
-  # The VPC and subnet configuration is passed in via the environment spec.
-  SubnetConfig:
-    VPC:
-      CIDR: '{{ environment.inputs.vpc_cidr}}'         # customization parameter
-    DNS:
-      Hostname: '{{ environment.inputs.dns_hostname}}' # customization parameter      
-
+  TaskSize:
+    x-small:
+      Cpu: 256
+      Memory: 512
+    small:
+      Cpu: 512
+      Memory: 1024
+    medium:
+      Cpu: 1024
+      Memory: 2048
+    large:
+      Cpu: 2048
+      Memory: 4096
+    x-large:
+      Cpu: 4096
+      Memory: 8192
 Resources:
-  VPC:
-    Type: AWS::EC2::VPC
+  # A log group for storing the stdout logs from this service's containers
+  LogGroup:
+    Type: AWS::Logs::LogGroup
     Properties:
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
-      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+      LogGroupName: '{{service.name}}/{{service_instance.name}}'
 
-  PublicSubnetOne:
-    Type: AWS::EC2::Subnet
+  # The task definition. This is a simple metadata description of what
+  # container to run, and what resource requirements it has.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
     Properties:
-      AvailabilityZone:
-         Fn::Select:
-         - 0
-         - Fn::GetAZs: {Ref: 'AWS::Region'}
-      VpcId: !Ref 'VPC'
-      CidrBlock: !Select [ 0, !Cidr [ !FindInMap ['SubnetConfig', 'VPC', 'CIDR'], 3, 8 ]]
-      MapPublicIpOnLaunch: true
+      Family: '{{service.name}}_{{service_instance.name}}'
+      Cpu: !FindInMap [TaskSize, '{{service_instance.inputs.task_size}}', Cpu]
+      Memory: !FindInMap [TaskSize, '{{service_instance.inputs.task_size}}', Memory]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: '{{environment.outputs.ECSTaskExecutionRole}}'
+      TaskRoleArn: !Ref "AWS::NoValue"
+      ContainerDefinitions:
+        - Name: '{{service_instance.name}}'
+          Cpu: !FindInMap [TaskSize, '{{service_instance.inputs.task_size}}', Cpu]
+          Memory: !FindInMap [TaskSize, '{{service_instance.inputs.task_size}}', Memory]
+          Image: '{{service_instance.inputs.image}}'
+          Environment:
+          {% set env_vars = service_instance.inputs.env_vars.split(';') %}
+          {% for env_var in  env_vars %}
+          {% set env_name, env_value = env_var.split('=') %}
+            - Name: '{{ env_name|trim }}'
+              Value: '{{ env_value|trim }}'
+          {% endfor %}
+          PortMappings:
+            - ContainerPort: '{{service_instance.inputs.port}}'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-create-group: 'True'
+              awslogs-group: '{{service.name}}/{{service_instance.name}}'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'fargate/service/{{service.name}}'
 
-  PublicSubnetTwo:
-    Type: AWS::EC2::Subnet
+  # The service_instance.inputs. The service is a resource which allows you to run multiple
+  # copies of a type of task, and gather up their logs and metrics, as well
+  # as monitor the number of running tasks and replace any that have crashed
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerRule
     Properties:
-      AvailabilityZone:
-         Fn::Select:
-         - 1
-         - Fn::GetAZs: {Ref: 'AWS::Region'}
-      VpcId: !Ref 'VPC'
-      CidrBlock: !Select [ 1, !Cidr [ !FindInMap ['SubnetConfig', 'VPC', 'CIDR'], 3, 8 ]]
-      MapPublicIpOnLaunch: true
+      ServiceName: '{{service.name}}_{{service_instance.name}}_spot'
+      Cluster: '{{environment.outputs.ClusterName}}'
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: '{{service_instance.inputs.desired_count}}'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - '{{environment.outputs.ContainerSecurityGroup}}'
+          Subnets:
+            - '{{environment.outputs.PublicSubnetOne}}'
+            - '{{environment.outputs.PublicSubnetTwo}}'
+            - '{{environment.outputs.PublicSubnetThree}}'
+      TaskDefinition: !Ref 'TaskDefinition'
+      LoadBalancers:
+        - ContainerName: '{{service_instance.name}}'
+          ContainerPort: '{{service_instance.inputs.port}}'
+          TargetGroupArn: !Ref 'TargetGroup'
 
-  PublicSubnetThree:
-    Type: AWS::EC2::Subnet
+  # A target group. This is used for keeping track of all the tasks, and
+  # what IP addresses / port numbers they have. You can query it yourself,
+  # to use the addresses yourself, but most often this target group is just
+  # connected to an application load balancer, or network load balancer, so
+  # it can automatically distribute traffic across all the targets.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      AvailabilityZone:
-         Fn::Select:
-         - 2
-         - Fn::GetAZs: {Ref: 'AWS::Region'}
-      VpcId: !Ref 'VPC'
-      CidrBlock: !Select [ 2, !Cidr [ !FindInMap ['SubnetConfig', 'VPC', 'CIDR'], 3, 8 ]]
-      MapPublicIpOnLaunch: true
+      TargetType: ip
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: 200-299
+      # Note that the Name property has a 32 character limit, which could be
+      # reached by using either {{service.name}}, {{service_instance.name}}
+      # or a combination of both as we're doing here, so we truncate the name to 29 characters
+      # plus an ellipsis different from '...' or '---' to avoid running into errors.
+      Name: '{{(service.name~"--"~service_instance.name)|truncate(29, true, "zzz")}}'
+      Port: '{{service_instance.inputs.port}}'
+      Protocol: HTTP
+      UnhealthyThresholdCount: 10
+      VpcId: '{{environment.outputs.VpcId}}'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '5'
+        - Key: slow_start.duration_seconds
+          Value: '60'
+  
+  # Create a rule on the load balancer for routing traffic to the target group
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref 'TargetGroup'
+          Type: 'forward'
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '*'
+      ListenerArn: !Ref LoadBalancerListener
+      Priority: 1
 
-  # Setup networking resources for the public subnets. Containers
-  # in the public subnets have public IP addresses and the routing table
-  # sends network traffic via the internet gateway.
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-  GatewayAttachement:
-    Type: AWS::EC2::VPCGatewayAttachment
-    Properties:
-      VpcId: !Ref 'VPC'
-      InternetGatewayId: !Ref 'InternetGateway'
-  PublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref 'VPC'
-  PublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: GatewayAttachement
-    Properties:
-      RouteTableId: !Ref 'PublicRouteTable'
-      DestinationCidrBlock: '0.0.0.0/0'
-      GatewayId: !Ref 'InternetGateway'
-  PublicSubnetOneRouteTableAssociation:
-      Type: AWS::EC2::SubnetRouteTableAssociation
-      Properties:
-        SubnetId: !Ref PublicSubnetOne
-        RouteTableId: !Ref PublicRouteTable
-  PublicSubnetTwoRouteTableAssociation:
-      Type: AWS::EC2::SubnetRouteTableAssociation
-      Properties:
-        SubnetId: !Ref PublicSubnetTwo
-        RouteTableId: !Ref PublicRouteTable
-  PublicSubnetThreeRouteTableAssociation:
-      Type: AWS::EC2::SubnetRouteTableAssociation
-      Properties:
-        SubnetId: !Ref PublicSubnetThree
-        RouteTableId: !Ref PublicRouteTable
+  EcsSecurityGroupIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties: 
+      Description: Ingress from the ALB
+      GroupId: '{{environment.outputs.ContainerSecurityGroup}}'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'LoadBalancerSG'
 
-  # ECS Resources
-  ECSCluster:
-    Type: AWS::ECS::Cluster
-
-  # A security group for the containers we will run in Fargate.
-  # Rules are added to this security group based on what ingress you
-  # add for the cluster.
-  ContainerSecurityGroup:
+  # Load balancer, hosted in public subnets that is accessible
+  # to the public or internally depending on the scope. It is 
+  # intended to route traffic to one or more public/private
+  # facing services.
+  LoadBalancerSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Access to the ECS Containers
-      VpcId: !Ref 'VPC'
+      GroupDescription: Access to the public facing load balancer
+      VpcId: '{{environment.outputs.VpcId}}'
+      SecurityGroupIngress:
+          {% if 'public' == service_instance.inputs.scope %}
+          # Allow access to ALB from anywhere on the internet
+          - CidrIp: 0.0.0.0/0
+            IpProtocol: -1
+          {% else %}
+          # Allow access only from the VPC CIDR
+          - CidrIp: '{{environment.outputs.VpcCIDR}}'
+            IpProtocol: -1
+            FromPort: '{{service_instance.inputs.port}}'
+            ToPort: '{{service_instance.inputs.port}}'
+          {% endif %}
 
-  # This is a role to allows ECS container agent makes calls to 
-  # the Amazon ECS API on your behalf.
-  ECSTaskExecutionRole:
-    Type: AWS::IAM::Role
+  {% if 'public' == service_instance.inputs.scope %}
+  {% set scheme = 'internet-facing' %}
+  {% set port = '80' %}
+  {% else %}
+  {% set scheme = 'internal' %}
+  {% set port = service_instance.inputs.port %}
+  {% endif %}
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      AssumeRolePolicyDocument:
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service:
-            - ecs.amazonaws.com
-            - ecs-tasks.amazonaws.com
-          Action: ['sts:AssumeRole']
-      Path: /
-      ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Scheme: '{{scheme}}'
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - '{{environment.outputs.PublicSubnetOne}}'
+        - '{{environment.outputs.PublicSubnetTwo}}'
+        - '{{environment.outputs.PublicSubnetThree}}'
+      SecurityGroups: [!Ref 'LoadBalancerSG']
 
-  DnsHostedZone:
-    Type: AWS::Route53::HostedZone
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
     Properties:
-      Name: !FindInMap ['SubnetConfig', 'DNS', 'Hostname']
-      HostedZoneConfig:
-        Comment: Private hosted zone
-      VPCs:
-        - VPCId: !Ref VPC
-          VPCRegion: !Ref AWS::Region        
+      DefaultActions:
+        - TargetGroupArn: !Ref 'TargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: '{{port}}'
+      Protocol: HTTP
+    
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - LoadBalancer
+    Properties:
+      AliasTarget:
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt LoadBalancer.DNSName
+      HostedZoneId: '{{environment.outputs.HostedZoneId}}'
+      Name: '{{service.name}}.{{environment.outputs.DnsHostname}}'
+      Type: A
 
-# These output values are will be available to service templates, given the
-# the 'environment' namespace, for example, environment.outputs.ClusterName.
 Outputs:
-  ContainerSecurityGroup:
-    Description: Container Security group
-    Value: !Ref 'ContainerSecurityGroup'
-  ClusterName:
-    Description: The name of the ECS cluster
-    Value: !Ref 'ECSCluster'
-  ECSTaskExecutionRole:
-    Description: The ARN of the ECS task execution role
-    Value: !GetAtt 'ECSTaskExecutionRole.Arn'
-  VpcId:
-    Description: The ID of the VPC that this stack is deployed in
-    Value: !Ref 'VPC'
-  PublicSubnetOne:
-    Description: Public subnet one
-    Value: !Ref 'PublicSubnetOne'
-  PublicSubnetTwo:
-    Description: Public subnet two
-    Value: !Ref 'PublicSubnetTwo'
-  PublicSubnetThree:
-    Description: Public subnet three
-    Value: !Ref 'PublicSubnetThree'
-  HostedZoneId:
-    Description: The ID of the hosted zone
-    Value: !Ref 'DnsHostedZone'
-  VpcCIDR:
-    Description: The VPC CIDR
-    Value: '{{ environment.inputs.vpc_cidr }}'
-  DnsHostname:
-    Description: The DNS hostname of the hosted zone
-    Value: '{{ environment.inputs.dns_hostname }}'
+  ServiceEndpoint:
+    Description: The URL to access the service
+    Value: !Sub "http://${LoadBalancer.DNSName}"
